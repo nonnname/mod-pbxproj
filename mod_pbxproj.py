@@ -190,7 +190,8 @@ class PBXFileReference(PBXType):
         self.remove('explicitFileType')
         self.remove('lastKnownFileType')
 
-        ext = os.path.splitext(self.get('name', ''))[1]
+        #ext = os.path.splitext(self.get('name', ''))[1]
+        ext = os.path.splitext(self.get('path', ''))[1]
         if os.path.isdir(self.get('path')) and ext != '.framework' and ext != '.bundle':
             f_type = 'folder'
             build_phase = None
@@ -214,7 +215,7 @@ class PBXFileReference(PBXType):
         self['explicitFileType'] = ft
 
     @classmethod
-    def Create(cls, os_path, tree='SOURCE_ROOT', ignore_unknown_type=False):
+    def Create(cls, os_path, tree='SOURCE_ROOT', ignore_unknown_type=False, name=None):
         if tree not in cls.trees:
             print 'Not a valid sourceTree type: %s' % tree
             return None
@@ -222,7 +223,7 @@ class PBXFileReference(PBXType):
         fr = cls()
         fr.id = cls.GenerateId()
         fr['path'] = os_path
-        fr['name'] = os.path.split(os_path)[1]
+        fr['name'] = name or os.path.split(os_path)[1]
         fr['sourceTree'] = '<absolute>' if os.path.isabs(os_path) else tree
         fr.guess_file_type(ignore_unknown_type=ignore_unknown_type)
 
@@ -281,7 +282,7 @@ class PBXBuildFile(PBXType):
 
     @classmethod
     def Create(cls, file_ref, weak=False):
-        if isinstance(file_ref, PBXFileReference):
+        if isinstance(file_ref, PBXFileReference) or isinstance(file_ref, PBXVariantGroup):
             file_ref = file_ref.id
 
         bf = cls()
@@ -301,7 +302,7 @@ class PBXGroup(PBXType):
 
         isa = ref.get('isa')
 
-        if isa != 'PBXFileReference' and isa != 'PBXGroup':
+        if isa != 'PBXFileReference' and isa != 'PBXGroup' and isa != 'PBXVariantGroup':
             return None
 
         if 'children' not in self:
@@ -367,7 +368,7 @@ class PBXReferenceProxy(PBXType):
     pass
 
 
-class PBXVariantGroup(PBXType):
+class PBXVariantGroup(PBXGroup):
     pass
 
 
@@ -698,6 +699,34 @@ class XcodeProject(PBXDict):
 
         return grp
 
+    def get_variant_groups_by_name(self, name, parent=None):
+        if parent:
+            groups = [g for g in self.objects.values() if g.get('isa') == 'PBXVariantGroup'
+                    and g.get_name() == name
+                    and parent.has_child(g)]
+        else:
+            groups = [g for g in self.objects.values() if g.get('isa') == 'PBXVariantGroup'
+                    and g.get_name() == name]
+        return groups
+ 
+    def get_or_create_variant_group(self, name, path=None, parent=None):
+        if not name:
+            return None
+        if not parent:
+            parent = self.root_group
+        elif not isinstance(parent, PBXGroup):
+            # assume it's an id
+            parent = self.objects.get(parent, self.root_group)
+        groups = self.get_variant_groups_by_name(name)
+        for grp in groups:
+            if parent.has_child(grp.id):
+                return grp
+        grp = PBXVariantGroup.Create(name, path)
+        parent.add_child(grp)
+        self.objects[grp.id] = grp
+        self.modified = True
+        return grp    
+
     def get_groups_by_os_path(self, path):
         path = os.path.abspath(path)
 
@@ -779,10 +808,15 @@ class XcodeProject(PBXDict):
 
         path_dict = {os.path.split(os_path)[0]: parent}
         special_list = []
+        lprojs = []
 
         for (grp_path, subdirs, files) in os.walk(os_path):
             parent_folder, folder_name = os.path.split(grp_path)
             parent = path_dict.get(parent_folder, parent)
+
+            if folder_name.endswith(".lproj"):
+                lprojs.append({'parent':parent, 'grp_path':grp_path, 'parent_folder':parent_folder, 'folder_name':folder_name, 'files':files})
+                continue
 
             if [sp for sp in special_list if parent_folder.startswith(sp)]:
                 continue
@@ -833,6 +867,36 @@ class XcodeProject(PBXDict):
             if not recursive:
                 break
 
+        for lproj in lprojs:
+          for f in lproj['files']:
+            if not f.endswith(".strings"):
+              continue
+            grp = self.get_or_create_variant_group(f, path=None, parent=lproj['parent'])
+            if f[0] == '.' or [m for m in excludes if re.match(m, f)]:
+                continue
+            kwds = {
+                'create_build_files': False,
+                'parent': grp,
+                'name': os.path.basename(lproj['grp_path']).replace(".lproj", "")
+            }
+            path = os.path.join(lproj['grp_path'], f)
+            self.add_file(path, **kwds)
+
+            if len(self.get_build_files(grp.id)) > 0:
+              continue
+            dup = False
+            for i in results:
+              if isinstance(i, PBXBuildFile) and i['fileRef'] == grp.id:
+                dup = True
+                break
+            if dup:
+                continue
+            phases = self.get_build_phases("PBXResourcesBuildPhase")
+            for phase in phases:
+                build_file = PBXBuildFile.Create(grp)
+                phase.add_build_file(build_file)
+                results.append(build_file)
+
         for r in results:
             self.objects[r.id] = r
 
@@ -850,7 +914,7 @@ class XcodeProject(PBXDict):
 
         return self.add_file(f_path, parent, tree, create_build_files, weak, ignore_unknown_type=ignore_unknown_type)
 
-    def add_file(self, f_path, parent=None, tree='SOURCE_ROOT', create_build_files=True, weak=False, ignore_unknown_type=False):
+    def add_file(self, f_path, parent=None, tree='SOURCE_ROOT', create_build_files=True, weak=False, ignore_unknown_type=False, name=None):
         results = []
         abs_path = ''
 
@@ -870,7 +934,7 @@ class XcodeProject(PBXDict):
             # assume it's an id
             parent = self.objects.get(parent, self.root_group)
 
-        file_ref = PBXFileReference.Create(f_path, tree, ignore_unknown_type=ignore_unknown_type)
+        file_ref = PBXFileReference.Create(f_path, tree, ignore_unknown_type=ignore_unknown_type, name=name)
         parent.add_child(file_ref)
         results.append(file_ref)
 
